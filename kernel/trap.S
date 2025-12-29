@@ -1,4 +1,3 @@
-
 .section .text
 .extern syscall_handle
 .extern print
@@ -7,6 +6,7 @@
 .extern current_trapframe
 .extern syscall_action
 .extern user_return
+.extern current
 
 .global trap_entry
 .global enter_user
@@ -14,6 +14,12 @@
 trap_entry:
     /* 切换到内核栈：sp <-> sscratch */
     csrrw sp, sscratch, sp
+
+    /* 检查是否来自内核态 (sscratch == 0) */
+    bnez sp, 1f
+    csrrw sp, sscratch, sp /* 恢复 sp (因为来自内核，sscratch 原本是 0，现在 sp 是 0，需要换回来) */
+    j trap_from_kernel
+1:
 
     /* 保存 t6 到内核栈，以便使用 t6 */
     addi sp, sp, -8
@@ -63,8 +69,12 @@ trap_entry:
     csrr t5, sscratch
     sd t5, 16(t6)
 
-    /* 恢复 sscratch 为内核栈指针 */
-    csrw sscratch, sp
+    /* 恢复 sscratch 为 0，标记进入内核态 */
+    csrw sscratch, x0
+
+    /* Enable SUM (bit 18) to allow kernel access to user memory */
+    li t0, 0x40000
+    csrs sstatus, t0
 
     csrr t0, sepc
     sd t0, 256(t6)            # save sepc
@@ -152,11 +162,35 @@ trap_other:
 halt_loop:
     j halt_loop
 
+trap_from_kernel:
+    la a0, msg_ktrap
+    call print
+    csrr a0, scause
+    call print_hex
+    la a0, msg_sepc
+    call print
+    csrr a0, sepc
+    call print_hex
+    la a0, msg_stval
+    call print
+    csrr a0, stval
+    call print_hex
+    la a0, msg_nl
+    call print
+    j halt_loop
+
 /* 从 trapframe 恢复寄存器并 sret 到用户态 */
 .global user_restore
 user_restore:
     la t6, current_trapframe
     ld t6, 0(t6)
+
+    /* Restore sscratch from current->kstack */
+    /* kstack is at offset 288 in struct proc */
+    la t0, current
+    ld t0, 0(t0)
+    ld t0, 288(t0)
+    csrw sscratch, t0
 
     /* Restore CSRs first using t0, t1 as scratch */
     ld t0, 256(t6)          # sepc
@@ -209,5 +243,7 @@ msg_pf:
     .asciz "PageFault scause="
 msg_stval:
     .asciz " stval="
+msg_ktrap:
+    .asciz "Kernel Trap! scause="
 msg_nl:
     .asciz "\n"

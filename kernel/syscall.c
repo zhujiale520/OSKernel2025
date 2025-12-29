@@ -117,6 +117,7 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 {
     (void)a4; (void)a5; (void)a6;
     int slot = proc_slot(current);
+    if (slot < 0) return (uint64_t)-1;
     switch (a7) {
     case 93: /* exit */
         syscall_exit_code = a0;
