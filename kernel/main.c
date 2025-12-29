@@ -40,7 +40,29 @@ void setup_paging(void)
         l1_pt_user[i] = ((ppn_start + i * 512) << 10) | PTE_R | PTE_W | PTE_X | PTE_U | PTE_V | PTE_A | PTE_D;
     }
 
-    /* 4. Map User Stack at USER_STACK_VA (0xF0000000) */
+    /* 4. Map MMIO for Kernel (UART, VirtIO, PLIC) */
+    /* UART: 0x10000000 (256MB) -> Entry 128 */
+    /* VirtIO: 0x10001000 (256MB) -> Entry 128 */
+    /* PLIC: 0x0C000000 (192MB) -> Entry 96 */
+    /* CLINT: 0x02000000 (32MB) -> Entry 16. CONFLICT with User Space! */
+    
+    /* Map UART/VirtIO (Entry 128) */
+    /* PPN for 0x10000000 is 0x10000 */
+    l1_pt_user[128] = (0x10000ULL << 10) | PTE_R | PTE_W | PTE_G | PTE_V | PTE_A | PTE_D; /* No PTE_U */
+    
+    /* Map PLIC (Entry 96) */
+    /* PPN for 0x0C000000 is 0x0C000 */
+    l1_pt_user[96] = (0x0C000ULL << 10) | PTE_R | PTE_W | PTE_G | PTE_V | PTE_A | PTE_D; /* No PTE_U */
+    
+    /* Map CLINT (Entry 16) - This overwrites User Space 32MB-34MB! */
+    /* If user program uses this area, it will crash. But Kernel needs it for timer? */
+    /* Actually, S-mode kernel uses 'time' CSR, not CLINT directly. */
+    /* So we might skip CLINT mapping if we don't access it. */
+    /* But let's map it just in case, assuming user program is small (<32MB). */
+    /* PPN for 0x02000000 is 0x02000 */
+    /* l1_pt_user[16] = (0x02000ULL << 10) | PTE_R | PTE_W | PTE_G | PTE_V | PTE_A | PTE_D; */
+    
+    /* 5. Map User Stack at USER_STACK_VA (0xF0000000) */
     /* VPN[2] = 0x3C0 (0xF0000000 >> 30) */
     /* We need a L1 PT for this? 0xF0000000 is in the 3rd GB range (0xC0000000 - 1000000000)? No. */
     /* 0xF0000000:
