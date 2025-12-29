@@ -85,7 +85,12 @@ static int load_elf_from_buffer(const uint8_t *img, uint32_t size, uint64_t *ent
 
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != 1) continue;
-        uint64_t dest = LOAD_BASE + (ph[i].p_vaddr - base_vaddr);
+        /* 
+         * Load to Physical Address (mapped in Kernel at 0x80400000+offset)
+         * We assume User VA 0 maps to PA LOAD_BASE.
+         */
+        uint64_t dest = LOAD_BASE + ph[i].p_vaddr;
+        
         if (ph[i].p_offset + ph[i].p_filesz > size) {
             print("elf: segment oob\n");
             return -1;
@@ -97,7 +102,7 @@ static int load_elf_from_buffer(const uint8_t *img, uint32_t size, uint64_t *ent
     }
 
     if (entry_out) {
-        *entry_out = LOAD_BASE + (eh->e_entry - base_vaddr);
+        *entry_out = eh->e_entry; /* Return Virtual Address */
     }
     print("elf: load ok entry=");
     if (entry_out) print_hex(*entry_out); else print_hex(0);

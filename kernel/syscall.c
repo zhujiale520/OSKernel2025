@@ -180,7 +180,7 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     case 124: /* sched_yield */
         return 0;
     case 214: { /* brk */
-        if (a0 == 0) return 0x80500000;
+        if (a0 == 0) return 0x00200000; /* Return 2MB as heap start (VA) */
         return a0; /* 直接返回请求地址 */
     }
     case 222: /* mmap */
