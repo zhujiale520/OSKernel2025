@@ -92,9 +92,10 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     case 93: /* exit */
         syscall_exit_code = a0;
         syscall_action = 1;
+        current->state = P_UNUSED;
         return 0;
     case 64: /* write */
-        if (a0 == 1) { /* stdout */
+        if (a0 == 1 || a0 == 2) { /* stdout or stderr */
             write_stdout((const char *)a1, a2);
             return a2;
         }
@@ -179,6 +180,7 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     case 124: /* sched_yield */
         return 0;
     case 214: { /* brk */
+        if (a0 == 0) return 0x80500000;
         return a0; /* 直接返回请求地址 */
     }
     case 222: /* mmap */

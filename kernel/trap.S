@@ -107,6 +107,10 @@ trap_syscall:
     ld t4, 0(t3)
     beqz t4, trap_sys_ret_user
     sd zero, 0(t3)
+    
+    /* 切换到 boot_stack 以便安全地重新调度和重用进程槽 */
+    la sp, boot_stack_top
+    
     la t5, user_return
     jalr t5
 
