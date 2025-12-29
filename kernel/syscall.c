@@ -57,7 +57,7 @@ volatile uint64_t syscall_action = 0;
 volatile uint64_t syscall_exit_code = 0;
 
 /* 每进程 FD 数据缓存，按 proc_slot(current) 选择槽 */
-#define FILE_BUF_SZ 65536
+#define FILE_BUF_SZ 4096
 
 enum fd_type { FD_NONE = 0, FD_FILE, FD_PIPE, FD_DEVICE };
 
