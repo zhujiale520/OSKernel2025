@@ -8,7 +8,7 @@ struct trapframe {
     uint64_t sstatus;
 };
 
-#define MAX_FD 16
+#define MAX_FD 128
 #define MAX_PROC 8
 #define KSTACK_SIZE 8192
 
@@ -27,7 +27,7 @@ struct proc {
     struct trapframe tf;
     uint64_t kstack;
     uint64_t heap_top;
-    int fds[MAX_FD];
+    int fds[MAX_FD]; /* Values are indices into global file_table, -1 if closed */
     char cwd[256];
 };
 
