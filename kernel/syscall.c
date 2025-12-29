@@ -96,6 +96,8 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         return 0;
     case 64: /* write */
         if (a0 == 1 || a0 == 2) { /* stdout or stderr */
+            /* a1 is virtual address, but we are in S-mode with SUM=1.
+               We can access it directly if mapped. */
             write_stdout((const char *)a1, a2);
             return a2;
         }

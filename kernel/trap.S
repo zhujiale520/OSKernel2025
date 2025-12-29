@@ -74,11 +74,30 @@ trap_entry:
     csrr t0, scause
     li t1, 8                  # user-mode ecall
     beq t0, t1, trap_syscall
-    # li t1, 9                  # supervisor-mode ecall (未用)
-    # beq t0, t1, trap_syscall
-    # li t1, 11                 # machine-mode ecall
-    # beq t0, t1, trap_syscall
+    li t1, 13                 # Load Page Fault
+    beq t0, t1, trap_page_fault
+    li t1, 15                 # Store Page Fault
+    beq t0, t1, trap_page_fault
+    li t1, 12                 # Instruction Page Fault
+    beq t0, t1, trap_page_fault
     j trap_other
+
+trap_page_fault:
+    la a0, msg_pf
+    call print
+    csrr a0, scause
+    call print_hex
+    la a0, msg_stval
+    call print
+    csrr a0, stval
+    call print_hex
+    la a0, msg_sepc
+    call print
+    csrr a0, sepc
+    call print_hex
+    la a0, msg_nl
+    call print
+    j halt_loop
 
 trap_syscall:
     # advance sepc in trapframe to skip ecall
@@ -186,5 +205,9 @@ msg_trap:
     .asciz "trap scause="
 msg_sepc:
     .asciz " sepc="
+msg_pf:
+    .asciz "PageFault scause="
+msg_stval:
+    .asciz " stval="
 msg_nl:
     .asciz "\n"
