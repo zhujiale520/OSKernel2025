@@ -50,6 +50,14 @@ static void *memcpy_simple(void *dst, const void *src, size_t n)
     return dst;
 }
 
+static void *memset_simple(void *dst, int v, size_t n)
+{
+    unsigned char *d = (unsigned char *)dst;
+    for (size_t i = 0; i < n; i++) d[i] = (unsigned char)v;
+    return dst;
+}
+
+
 static size_t min_size(size_t a, size_t b) { return a < b ? a : b; }
 
 /* syscall_action: 0=继续返回用户态，1=用户进程结束回到内核 */
@@ -79,6 +87,12 @@ static struct fd_data {
     uint32_t size;
     uint32_t off;
 } fd_data_pool[MAX_PROC][MAX_FD];
+
+void syscall_init(void)
+{
+    memset_simple(fd_data_pool, 0, sizeof(fd_data_pool));
+    memset_simple(pipes, 0, sizeof(pipes));
+}
 
 static pid_t last_child = -1;
 

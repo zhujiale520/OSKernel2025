@@ -250,6 +250,8 @@ void main()
         shutdown();
     }
 
+    extern void syscall_init(void);
+    syscall_init();
     proc_init();
     run_next_test();
 }
