@@ -5,6 +5,8 @@
 .extern print_hex
 .extern boot_stack_top
 .extern user_stack_top
+.extern syscall_action
+.extern user_return
 
 .global trap_entry
 .global enter_user
@@ -14,9 +16,15 @@ trap_entry:
     csrrw sp, mscratch, sp
 
     csrr t0, mcause
+    li t1, 8                  # user-mode ecall
+    beq t0, t1, trap_syscall
+    li t1, 9                  # supervisor-mode ecall (未用)
+    beq t0, t1, trap_syscall
     li t1, 11                 # machine-mode ecall
-    bne t0, t1, trap_other
+    beq t0, t1, trap_syscall
+    j trap_other
 
+trap_syscall:
     # advance mepc to skip ecall
     csrr t2, mepc
     addi t2, t2, 4
@@ -33,7 +41,18 @@ trap_entry:
     mv a7, a7
     call syscall_handle
 
-    /* 恢复用户栈 */
+    /* 检查是否需要直接回到内核（exit 等） */
+    la t3, syscall_action
+    ld t4, 0(t3)
+    beqz t4, trap_sys_ret_user
+
+    /* 清除动作标志后直接跳转到 user_return */
+    sd zero, 0(t3)
+    la t5, user_return
+    jr t5
+
+trap_sys_ret_user:
+    /* 恢复用户栈返回用户态 */
     csrrw sp, mscratch, sp
     mret
 

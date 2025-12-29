@@ -203,6 +203,52 @@ static void print_short_name(const uint8_t name[11])
     print("\n");
 }
 
+/* 将磁盘中的短文件名转换为以0结尾的字符串，例如 "TEST    TXT" -> "TEST.TXT" */
+static void short_name_to_str(const uint8_t name[11], char *out, size_t out_len)
+{
+    size_t p = 0;
+    for (int i = 0; i < 8 && p + 1 < out_len; i++) {
+        if (name[i] == ' ') break;
+        out[p++] = name[i];
+    }
+    int has_ext = 0;
+    for (int i = 8; i < 11; i++) {
+        if (name[i] != ' ') { has_ext = 1; break; }
+    }
+    if (has_ext && p + 1 < out_len) {
+        out[p++] = '.';
+        for (int i = 8; i < 11 && p + 1 < out_len; i++) {
+            if (name[i] == ' ') break;
+            out[p++] = name[i];
+        }
+    }
+    out[p] = '\0';
+}
+
+static size_t tiny_strlen(const char *s)
+{
+    size_t l = 0; while (s[l]) l++; return l;
+}
+
+static int contains_keyword_case_insensitive(const char *name, const char *key)
+{
+    size_t nlen = tiny_strlen(name);
+    size_t klen = tiny_strlen(key);
+    if (klen == 0 || klen > nlen) return 0;
+    for (size_t i = 0; i + klen <= nlen; i++) {
+        int match = 1;
+        for (size_t j = 0; j < klen; j++) {
+            char c1 = name[i + j];
+            char c2 = key[j];
+            if (c1 >= 'a' && c1 <= 'z') c1 = c1 - 'a' + 'A';
+            if (c2 >= 'a' && c2 <= 'z') c2 = c2 - 'a' + 'A';
+            if (c1 != c2) { match = 0; break; }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
 int fat32_list_root(void)
 {
     uint32_t cluster = fat.root_cluster;
@@ -275,6 +321,44 @@ int fat32_read_file(const char *name, uint8_t *buf, uint32_t buf_size, uint32_t 
                     file_cluster = next;
                 }
                 return 0;
+            }
+        }
+        if (fat32_read_fat_entry(cluster, &cluster) != 0) {
+            print("fat32: read FAT entry failed\n");
+            return -1;
+        }
+    }
+    return -1;
+}
+
+/* 在根目录中查找短文件名包含关键字的普通文件，返回其短名字符串 */
+int fat32_find_file_keyword(const char *keyword, char *out_name, size_t out_len, uint32_t *out_size)
+{
+    uint32_t cluster = fat.root_cluster;
+    while (cluster < 0x0FFFFFF8) {
+        uint64_t first_sector = cluster_to_sector(cluster);
+        for (uint32_t s = 0; s < fat.sectors_per_cluster; s++) {
+            if (virtio_blk_read_sector(first_sector + s, sector_buf) != 0) {
+                print("fat32: read sector failed\n");
+                return -1;
+            }
+            for (int off = 0; off < 512; off += 32) {
+                struct fat_dir_entry *ent = (struct fat_dir_entry *)(sector_buf + off);
+                if (ent->name[0] == 0x00) return -1; /* 目录结束 */
+                if (ent->name[0] == 0xE5) continue;
+                if (ent->attr == ATTR_LONG_NAME) continue;
+                if (ent->attr & 0x10) continue; /* 目录跳过 */
+                char name_buf[16];
+                short_name_to_str(ent->name, name_buf, sizeof(name_buf));
+                if (contains_keyword_case_insensitive(name_buf, keyword)) {
+                    /* 命中 */
+                    size_t need = tiny_strlen(name_buf) + 1;
+                    if (need > out_len) need = out_len;
+                    for (size_t i = 0; i < need - 1; i++) out_name[i] = name_buf[i];
+                    out_name[need - 1] = '\0';
+                    if (out_size) *out_size = ent->file_size;
+                    return 0;
+                }
             }
         }
         if (fat32_read_fat_entry(cluster, &cluster) != 0) {
