@@ -98,10 +98,10 @@ static pid_t last_child = -1;
 
 static void write_stdout(const char *p, uint64_t len)
 {
+    char buf[2] = {0, 0};
     for (uint64_t i = 0; i < len; i++) {
-        char c = p[i];
-        if (c == '\0') break;
-        print((const char *)&c);
+        buf[0] = p[i];
+        print(buf);
     }
 }
 
