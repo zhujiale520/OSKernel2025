@@ -35,6 +35,37 @@ struct tms {
     long tms_cstime;
 };
 
+struct kstat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    unsigned long __pad1;
+    int64_t st_size;
+    int32_t st_blksize;
+    int32_t __pad2;
+    int64_t st_blocks;
+    long st_atime_sec;
+    long st_atime_nsec;
+    long st_mtime_sec;
+    long st_mtime_nsec;
+    long st_ctime_sec;
+    long st_ctime_nsec;
+    unsigned int __unused[2];
+};
+
+#define S_IFMT  00170000
+#define S_IFSOCK 0140000
+#define S_IFLNK  0120000
+#define S_IFREG  0100000
+#define S_IFBLK  0060000
+#define S_IFDIR  0040000
+#define S_IFCHR  0020000
+#define S_IFIFO  0010000
+
 void print(const char *s);
 void print_hex(uint64_t v);
 void shutdown();
@@ -342,7 +373,31 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     case 40: /* mount */
         return 0;
     case 80: /* fstat */
+    {
+        int fd = (int)a0;
+        struct kstat *kst = (struct kstat *)a1;
+        if (fd < 0 || fd >= MAX_FD || current->fds[fd] == -1) return (uint64_t)-1;
+        
+        memset_simple(kst, 0, sizeof(struct kstat));
+        kst->st_nlink = 1;
+        kst->st_blksize = 512;
+        
+        if (fd == 0 || fd == 1 || fd == 2) {
+            kst->st_mode = S_IFCHR | 0600;
+        } else {
+            struct fd_data *fdp = &fd_data_pool[slot][fd];
+            if (fdp->type == FD_PIPE) {
+                kst->st_mode = S_IFIFO | 0600;
+            } else if (fdp->is_dir) {
+                kst->st_mode = S_IFDIR | 0755;
+                kst->st_size = fdp->size;
+            } else {
+                kst->st_mode = S_IFREG | 0644;
+                kst->st_size = fdp->size;
+            }
+        }
         return 0;
+    }
     case 23: /* dup */
     {
         int oldfd = (int)a0;

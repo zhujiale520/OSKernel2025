@@ -22,6 +22,7 @@ static void *memset_simple(void *dst, int v, size_t n)
     return dst;
 }
 
+
 /* 依赖底层块设备 */
 int virtio_blk_read_sector(uint64_t sector, void *buf);
 

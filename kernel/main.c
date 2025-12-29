@@ -76,7 +76,7 @@ void setup_paging(void)
     /* l1_pt_user covers 0x0 to 0x40000000 (1GB). */
     /* Entry 128 corresponds to 256MB. */
     /* Let's map entry 128 of l1_pt_user to user_stack_real (2MB huge page, though we only use 16KB) */
-    uint64_t stack_ppn = ((uint64_t)user_stack_real) >> 12;
+    /* uint64_t stack_ppn = ((uint64_t)user_stack_real) >> 12; */
     /* Note: user_stack_real is 4KB aligned, but for 2MB page we need 2MB alignment? */
     /* Yes, for huge page PPN must be aligned. user_stack_real might not be 2MB aligned. */
     /* So we should use 4KB pages for stack. We need L0 PT. */
