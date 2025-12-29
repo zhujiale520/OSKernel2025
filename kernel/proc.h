@@ -26,7 +26,9 @@ struct proc {
     int exit_code;
     struct trapframe tf;
     uint64_t kstack;
+    uint64_t heap_top;
     int fds[MAX_FD];
+    char cwd[256];
 };
 
 extern struct proc *current;

@@ -28,7 +28,11 @@ struct proc *proc_alloc(int ppid)
             p->pid = ++next_pid;
             p->ppid = ppid;
             p->exit_code = 0;
-            for (int j = 0; j < MAX_FD; j++) p->fds[j] = -1;
+            p->heap_top = 0x00200000; /* Initial heap top */
+            /* Reserve stdin/stdout/stderr */
+            p->fds[0] = 0; p->fds[1] = 1; p->fds[2] = 2;
+            for (int j = 3; j < MAX_FD; j++) p->fds[j] = -1;
+            p->cwd[0] = '/'; p->cwd[1] = '\0';
             return p;
         }
     }

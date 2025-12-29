@@ -58,8 +58,22 @@ volatile uint64_t syscall_exit_code = 0;
 
 /* 每进程 FD 数据缓存，按 proc_slot(current) 选择槽 */
 #define FILE_BUF_SZ 65536
+
+enum fd_type { FD_NONE = 0, FD_FILE, FD_PIPE, FD_DEVICE };
+
+struct pipe {
+    int used;
+    int ref;
+    uint8_t buf[4096];
+    uint32_t r;
+    uint32_t w;
+};
+static struct pipe pipes[32];
+
 static struct fd_data {
     int used;
+    enum fd_type type;
+    int pipe_idx;
     int is_dir;
     uint8_t buf[FILE_BUF_SZ];
     uint32_t size;
@@ -88,6 +102,7 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     (void)a4; (void)a5; (void)a6;
+    int slot = proc_slot(current);
     switch (a7) {
     case 93: /* exit */
         syscall_exit_code = a0;
@@ -96,16 +111,27 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         return 0;
     case 64: /* write */
         if (a0 == 1 || a0 == 2) { /* stdout or stderr */
-            /* a1 is virtual address, but we are in S-mode with SUM=1.
-               We can access it directly if mapped. */
             write_stdout((const char *)a1, a2);
             return a2;
         }
         if (a0 >= 0 && a0 < MAX_FD && current->fds[a0] != -1) {
-            int slot = proc_slot(current);
             struct fd_data *fdp = &fd_data_pool[slot][a0];
             if (!fdp->used) return (uint64_t)-1;
-            /* 静默接受写入，更新偏移 */
+            
+            if (fdp->type == FD_PIPE) {
+                struct pipe *p = &pipes[fdp->pipe_idx];
+                const char *src = (const char *)a1;
+                uint32_t cnt = 0;
+                for (uint64_t i = 0; i < a2; i++) {
+                    if ((p->w + 1) % 4096 == p->r) break; /* Full */
+                    p->buf[p->w] = src[i];
+                    p->w = (p->w + 1) % 4096;
+                    cnt++;
+                }
+                return cnt;
+            }
+            
+            /* File write: update offset only (read-only fs) */
             fdp->off += (uint32_t)a2;
             if (fdp->off > fdp->size) fdp->size = fdp->off;
             return a2;
@@ -114,9 +140,22 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     case 63: { /* read */
         int fd = (int)a0;
         if (fd < 0 || fd >= MAX_FD || current->fds[fd] == -1) return (uint64_t)-1;
-        int slot = proc_slot(current);
         struct fd_data *fdp = &fd_data_pool[slot][fd];
         if (!fdp->used) return (uint64_t)-1;
+        
+        if (fdp->type == FD_PIPE) {
+            struct pipe *p = &pipes[fdp->pipe_idx];
+            char *dst = (char *)a1;
+            uint32_t cnt = 0;
+            for (uint64_t i = 0; i < a2; i++) {
+                if (p->r == p->w) break; /* Empty */
+                dst[i] = p->buf[p->r];
+                p->r = (p->r + 1) % 4096;
+                cnt++;
+            }
+            return cnt;
+        }
+        
         uint32_t off = fdp->off;
         uint32_t remain = (fdp->size > off) ? (fdp->size - off) : 0;
         uint32_t take = remain < (uint32_t)a2 ? remain : (uint32_t)a2;
@@ -131,9 +170,9 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         path = skip_prefixes(path);
         int fd = fd_alloc(current);
         if (fd < 0) return (uint64_t)-1;
-        int slot = proc_slot(current);
         struct fd_data *fdp = &fd_data_pool[slot][fd];
         fdp->used = 1; fdp->off = 0; fdp->size = 0; fdp->is_dir = 0;
+        fdp->type = FD_FILE;
 
         /* 特殊处理当前目录 "./" or "." -> 伪目录 fd */
         if (path[0] == '.' && path[1] == '\0') {
@@ -173,8 +212,19 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         return fd;
     }
     case 57: /* close */
-        fd_free(current, (int)a0);
+    {
+        int fd = (int)a0;
+        if (fd >= 0 && fd < MAX_FD && current->fds[fd] != -1) {
+            struct fd_data *fdp = &fd_data_pool[slot][fd];
+            if (fdp->type == FD_PIPE) {
+                pipes[fdp->pipe_idx].ref--;
+                if (pipes[fdp->pipe_idx].ref <= 0) pipes[fdp->pipe_idx].used = 0;
+            }
+            fdp->used = 0;
+            fd_free(current, fd);
+        }
         return 0;
+    }
     case 172: /* getpid */
         return 1000;
     case 173: /* getppid */
@@ -182,8 +232,9 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     case 124: /* sched_yield */
         return 0;
     case 214: { /* brk */
-        if (a0 == 0) return 0x00200000; /* Return 2MB as heap start (VA) */
-        return a0; /* 直接返回请求地址 */
+        if (a0 == 0) return current->heap_top;
+        current->heap_top = a0;
+        return a0;
     }
     case 222: /* mmap */
         return 0;
@@ -249,16 +300,22 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         return take;
     }
     case 49: /* chdir */
+    {
+        const char *path = (const char *)a0;
+        size_t i = 0;
+        for (; i < 255 && path[i]; i++) current->cwd[i] = path[i];
+        current->cwd[i] = '\0';
         return 0;
+    }
     case 17: /* getcwd */
     {
         char *buf = (char *)a0;
         size_t sz = (size_t)a1;
-        const char *root = "/";
         if (sz == 0) return (uint64_t)-1;
-        size_t l = 1; if (l >= sz) l = sz - 1;
-        memcpy_simple(buf, root, l);
-        buf[l] = '\0';
+        size_t len = 0;
+        while (current->cwd[len]) len++;
+        if (sz < len + 1) return (uint64_t)-1;
+        memcpy_simple(buf, current->cwd, len + 1);
         return (uint64_t)buf;
     }
     case 34: /* mkdirat */
@@ -272,14 +329,65 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     case 80: /* fstat */
         return 0;
     case 23: /* dup */
-        return fd_alloc(current);
+    {
+        int oldfd = (int)a0;
+        if (oldfd < 0 || oldfd >= MAX_FD || current->fds[oldfd] == -1) return (uint64_t)-1;
+        int newfd = fd_alloc(current);
+        if (newfd < 0) return (uint64_t)-1;
+        fd_data_pool[slot][newfd] = fd_data_pool[slot][oldfd];
+        if (fd_data_pool[slot][newfd].type == FD_PIPE) {
+            pipes[fd_data_pool[slot][newfd].pipe_idx].ref++;
+        }
+        return newfd;
+    }
     case 24: /* dup3 */
-        return fd_alloc(current);
+    {
+        int oldfd = (int)a0;
+        int newfd = (int)a1;
+        if (oldfd < 0 || oldfd >= MAX_FD || current->fds[oldfd] == -1) return (uint64_t)-1;
+        if (newfd < 0 || newfd >= MAX_FD) return (uint64_t)-1;
+        if (current->fds[newfd] != -1) {
+            /* close newfd first */
+            struct fd_data *fdp = &fd_data_pool[slot][newfd];
+            if (fdp->type == FD_PIPE) {
+                pipes[fdp->pipe_idx].ref--;
+                if (pipes[fdp->pipe_idx].ref <= 0) pipes[fdp->pipe_idx].used = 0;
+            }
+            fdp->used = 0;
+            fd_free(current, newfd);
+        }
+        current->fds[newfd] = newfd;
+        fd_data_pool[slot][newfd] = fd_data_pool[slot][oldfd];
+        if (fd_data_pool[slot][newfd].type == FD_PIPE) {
+            pipes[fd_data_pool[slot][newfd].pipe_idx].ref++;
+        }
+        return newfd;
+    }
     case 59: /* pipe2 */
         if (a0) {
             int *fd = (int *)a0;
-            fd[0] = fd_alloc(current);
-            fd[1] = fd_alloc(current);
+            int pidx = -1;
+            for (int i=0; i<32; i++) if (!pipes[i].used) { pidx = i; break; }
+            if (pidx == -1) return (uint64_t)-1;
+            
+            int f0 = fd_alloc(current);
+            if (f0 < 0) return (uint64_t)-1;
+            int f1 = fd_alloc(current);
+            if (f1 < 0) { fd_free(current, f0); return (uint64_t)-1; }
+            
+            pipes[pidx].used = 1;
+            pipes[pidx].ref = 2;
+            pipes[pidx].r = 0;
+            pipes[pidx].w = 0;
+            
+            struct fd_data *d0 = &fd_data_pool[slot][f0];
+            d0->used = 1; d0->type = FD_PIPE; d0->pipe_idx = pidx;
+            
+            struct fd_data *d1 = &fd_data_pool[slot][f1];
+            d1->used = 1; d1->type = FD_PIPE; d1->pipe_idx = pidx;
+            
+            fd[0] = f0;
+            fd[1] = f1;
         }
         return 0;
     default:
