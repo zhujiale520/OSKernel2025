@@ -1,6 +1,82 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Paging definitions */
+#define SATP_MODE_SV39 (8ULL << 60)
+#define PTE_V (1ULL << 0)
+#define PTE_R (1ULL << 1)
+#define PTE_W (1ULL << 2)
+#define PTE_X (1ULL << 3)
+#define PTE_U (1ULL << 4)
+#define PTE_G (1ULL << 5)
+#define PTE_A (1ULL << 6)
+#define PTE_D (1ULL << 7)
+
+/* Page tables - aligned to 4KB */
+uint64_t root_pt[512] __attribute__((aligned(4096)));
+uint64_t l1_pt_user[512] __attribute__((aligned(4096)));
+
+/* User stack physical memory */
+uint8_t user_stack_real[16384] __attribute__((aligned(4096)));
+#define USER_STACK_VA 0xF0000000UL
+
+void setup_paging(void)
+{
+    /* 1. Identity map Kernel (0x80000000 - 0xC0000000) using 1GB huge page */
+    /* VPN[2] for 0x80000000 is 2 */
+    /* PPN for 0x80000000 is 0x80000 */
+    /* Attributes: RWX, Global, Valid, Accessed, Dirty */
+    root_pt[2] = (0x80000ULL << 10) | PTE_R | PTE_W | PTE_X | PTE_G | PTE_V | PTE_A | PTE_D;
+
+    /* 2. Map User Space [0, 1GB) using Level 1 PT */
+    /* VPN[2] for 0x0 is 0. Point to l1_pt_user */
+    root_pt[0] = ((((uint64_t)l1_pt_user) >> 12) << 10) | PTE_V;
+
+    /* 3. Map User Code/Data [0, 128MB) -> [0x80400000, ...) using 2MB huge pages */
+    /* 0x80400000 PPN is 0x80400 */
+    /* We map 64 entries (64 * 2MB = 128MB) */
+    uint64_t ppn_start = 0x80400;
+    for (int i = 0; i < 64; i++) {
+        l1_pt_user[i] = ((ppn_start + i * 512) << 10) | PTE_R | PTE_W | PTE_X | PTE_U | PTE_V | PTE_A | PTE_D;
+    }
+
+    /* 4. Map User Stack at USER_STACK_VA (0xF0000000) */
+    /* VPN[2] = 0x3C0 (0xF0000000 >> 30) */
+    /* We need a L1 PT for this? 0xF0000000 is in the 3rd GB range (0xC0000000 - 1000000000)? No. */
+    /* 0xF0000000:
+       VPN[2] = (0xF0000000 >> 30) & 0x1FF = 3.
+       So we need entry 3 in root_pt.
+    */
+    /* We can map a 1GB huge page? No, we only have 16KB stack. */
+    /* We need a L1 PT for entry 3. Let's reuse l1_pt_user? No, that's for 0x0. */
+    /* Let's allocate another L1 PT or just map it in the 0x0 range? */
+    /* If we map stack at 0x10000000 (256MB), it falls into l1_pt_user (entry 128). */
+    /* l1_pt_user covers 0x0 to 0x40000000 (1GB). */
+    /* Entry 128 corresponds to 256MB. */
+    /* Let's map entry 128 of l1_pt_user to user_stack_real (2MB huge page, though we only use 16KB) */
+    uint64_t stack_ppn = ((uint64_t)user_stack_real) >> 12;
+    /* Note: user_stack_real is 4KB aligned, but for 2MB page we need 2MB alignment? */
+    /* Yes, for huge page PPN must be aligned. user_stack_real might not be 2MB aligned. */
+    /* So we should use 4KB pages for stack. We need L0 PT. */
+    
+    /* Alternative: Just map stack at 0x00000000 + offset? */
+    /* No, user program is at 0x0. */
+    
+    /* Let's just use the memory at 0x80400000 + X as stack? */
+    /* The user program is loaded at 0x80400000. */
+    /* We can put stack at the end of the mapped 128MB region? */
+    /* Say at 128MB - 4KB. */
+    /* VA = 0x07FF0000. */
+    /* This is inside the region we mapped. */
+    /* So we don't need special mapping for stack! */
+    /* We just point SP to a high address in the 0-128MB range. */
+    /* But we need to make sure we don't overwrite program data. */
+    /* Program is loaded at 0. */
+    /* Let's use 0x04000000 (64MB) as stack top. */
+    /* This maps to PA 0x80400000 + 64MB = 0x84400000. */
+    /* This is safe. */
+}
+
 void print(const char *str);
 void print_hex(uint64_t num);
 
@@ -29,23 +105,39 @@ static void *memcpy_simple(void *dst, const void *src, size_t n)
     return dst;
 }
 
+/* Setup stack in the mapped region (0-128MB). We use 64MB (0x4000000) as top */
+#define USER_STACK_TOP_VA 0x04000000UL
+/* Corresponding PA is 0x80400000 + 0x04000000 = 0x84400000 */
+#define USER_STACK_TOP_PA (0x80400000UL + 0x04000000UL)
+
 static uint64_t setup_user_stack(const char *prog_name)
 {
-    uintptr_t sp = (uintptr_t)user_stack_top;
+    /* We write to PA, but calculate VA for SP */
+    uintptr_t sp_pa = (uintptr_t)USER_STACK_TOP_PA;
+    uintptr_t sp_va = (uintptr_t)USER_STACK_TOP_VA;
+    
     /* 放置程序名字符串 */
     size_t len = 0; while (prog_name[len]) len++;
-    sp -= (len + 1);
-    uint64_t arg0_ptr = sp;
-    memcpy_simple((void *)sp, prog_name, len + 1);
+    sp_pa -= (len + 1);
+    sp_va -= (len + 1);
+    
+    uint64_t arg0_ptr_va = sp_va;
+    memcpy_simple((void *)sp_pa, prog_name, len + 1);
+    
     /* 对齐 */
-    sp &= ~((uintptr_t)0xF);
+    sp_pa &= ~((uintptr_t)0xF);
+    sp_va &= ~((uintptr_t)0xF);
+    
     /* argc/argv 布局：sp[0]=argc, sp[1]=argv0, sp[2]=NULL */
-    sp -= 8 * 3;
-    uint64_t *p = (uint64_t *)sp;
+    sp_pa -= 8 * 3;
+    sp_va -= 8 * 3;
+    
+    uint64_t *p = (uint64_t *)sp_pa;
     p[0] = 1;
-    p[1] = arg0_ptr;
+    p[1] = arg0_ptr_va;
     p[2] = 0;
-    return sp;
+    
+    return sp_va;
 }
 
 /* 通过SBI关机 */
@@ -94,12 +186,19 @@ void run_next_test(void)
         asm volatile("csrr %0, sstatus" : "=r"(sstatus));
         sstatus &= ~(1ULL << 8); /* SPP=0 (User) */
         sstatus |= (1ULL << 5);  /* SPIE=1 (Enable interrupts after sret) */
+        sstatus |= (1ULL << 18); /* SUM=1 (Allow Supervisor User Memory access) */
         p->tf.sstatus = sstatus;
         /* stdout fd 1 preset */
         p->fds[0] = 0; p->fds[1] = 1; p->fds[2] = 2;
         p->state = P_RUNNABLE;
         current = p;
         current_trapframe = &p->tf;
+        
+        /* Enable Paging */
+        uint64_t satp_val = SATP_MODE_SV39 | (((uint64_t)root_pt) >> 12);
+        asm volatile("csrw satp, %0" :: "r"(satp_val));
+        asm volatile("sfence.vma");
+        
         schedule();
     }
 }
@@ -116,6 +215,8 @@ void main()
     print("School: Xi'an Jiaotong University\n");
     print("Kernel is now running in QEMU...\n");
     print("================================\n\n");
+    
+    setup_paging();
     
     // 2. 初始化 virtio-blk 与 FAT32，查找并运行包含 WRITE 关键字的测试文件
     if (virtio_blk_init() != 0) {
