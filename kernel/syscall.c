@@ -127,6 +127,11 @@ void syscall_init(void)
 
 static pid_t last_child = -1;
 
+struct iovec {
+    void  *iov_base;
+    size_t iov_len;
+};
+
 static void write_stdout(const char *p, uint64_t len)
 {
     char buf[2] = {0, 0};
@@ -149,6 +154,16 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     (void)a4; (void)a5; (void)a6;
     int slot = proc_slot(current);
     if (slot < 0) return (uint64_t)-1;
+
+    /* Debug print for syscalls */
+    /*
+    print("syscall: "); print_hex(a7);
+    print(" a0="); print_hex(a0);
+    print(" a1="); print_hex(a1);
+    print(" a2="); print_hex(a2);
+    print("\n");
+    */
+
     switch (a7) {
     case 93: /* exit */
         syscall_exit_code = a0;
@@ -177,12 +192,36 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                 return cnt;
             }
             
-            /* File write: update offset only (read-only fs) */
-            fdp->off += (uint32_t)a2;
-            if (fdp->off > fdp->size) fdp->size = fdp->off;
-            return a2;
+            /* File write: update offset and buffer */
+            uint32_t write_len = (uint32_t)a2;
+            if (fdp->off + write_len > FILE_BUF_SZ) {
+                write_len = FILE_BUF_SZ - fdp->off;
+            }
+            if (write_len > 0) {
+                memcpy_simple(fdp->buf + fdp->off, (const void *)a1, write_len);
+                fdp->off += write_len;
+                if (fdp->off > fdp->size) fdp->size = fdp->off;
+            }
+            return a2; /* Pretend we wrote everything even if truncated */
         }
         return (uint64_t)-1;
+    case 66: /* writev */
+    {
+        int fd = (int)a0;
+        const struct iovec *iov = (const struct iovec *)a1;
+        int iovcnt = (int)a2;
+        if (iovcnt < 0) return (uint64_t)-1;
+        uint64_t total = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            if (fd == 1 || fd == 2) {
+                write_stdout((const char *)iov[i].iov_base, iov[i].iov_len);
+                total += iov[i].iov_len;
+            } else {
+                /* Support file writev? Just skip for now or implement if needed */
+            }
+        }
+        return total;
+    }
     case 63: { /* read */
         int fd = (int)a0;
         if (fd < 0 || fd >= MAX_FD || current->fds[fd] == -1) return (uint64_t)-1;
@@ -213,6 +252,7 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     case 1024: /* open (legacy) */
     case 2: { /* open */
         const char *path = (const char *) (a7==2 ? a0 : a1);
+        int flags = (int) (a7==2 ? a1 : a2);
         path = skip_prefixes(path);
         int fd = fd_alloc(current);
         if (fd < 0) return (uint64_t)-1;
@@ -238,16 +278,26 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 
         uint32_t fsz = 0;
         if (fat32_read_file(path, fdp->buf, FILE_BUF_SZ, &fsz) != 0) {
+            /* Try case-insensitive */
+            int found = 0;
             if (path[0] >= 'a' && path[0] <= 'z') {
                 char tmp[64];
                 size_t i=0; for (; i<63 && path[i]; i++){ char c=path[i]; if (c>='a'&&c<='z') c-=32; tmp[i]=c; }
                 tmp[i]='\0';
-                if (fat32_read_file(tmp, fdp->buf, FILE_BUF_SZ, &fsz) != 0) {
-                    fdp->used = 0;
-                    fd_free(current, fd);
-                    return (uint64_t)-1;
+                if (fat32_read_file(tmp, fdp->buf, FILE_BUF_SZ, &fsz) == 0) {
+                    found = 1;
                 }
-            } else {
+            }
+            
+            if (!found) {
+                /* If O_CREAT (0100) is set, create a new empty file in memory */
+                if (flags & 0100) {
+                    fdp->size = 0;
+                    fdp->off = 0;
+                    /* Keep it as a valid file */
+                    return fd;
+                }
+                
                 fdp->used = 0;
                 fd_free(current, fd);
                 return (uint64_t)-1;
@@ -283,7 +333,9 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         return a0;
     }
     case 222: /* mmap */
-        return 0;
+        /* Return -1 to force libc to use brk, or implement simple mmap */
+        /* If we return 0, it might be interpreted as success at address 0 */
+        return (uint64_t)-1;
     case 215: /* munmap */
         return 0;
     case 96: /* set_tid_address */
