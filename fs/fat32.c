@@ -368,3 +368,37 @@ int fat32_find_file_keyword(const char *keyword, char *out_name, size_t out_len,
     }
     return -1;
 }
+
+/* 获取根目录下第 index 个普通文件的文件名 */
+int fat32_get_file_at_index(int index, char *out_name, size_t out_len, uint32_t *out_size)
+{
+    uint32_t cluster = fat.root_cluster;
+    int count = 0;
+    while (cluster < 0x0FFFFFF8) {
+        uint64_t first_sector = cluster_to_sector(cluster);
+        for (uint32_t s = 0; s < fat.sectors_per_cluster; s++) {
+            if (virtio_blk_read_sector(first_sector + s, sector_buf) != 0) return -1;
+            for (int off = 0; off < 512; off += 32) {
+                struct fat_dir_entry *ent = (struct fat_dir_entry *)(sector_buf + off);
+                if (ent->name[0] == 0x00) return -1; /* End of dir */
+                if (ent->name[0] == 0xE5) continue;
+                if (ent->attr == ATTR_LONG_NAME) continue;
+                if (ent->attr & 0x10) continue; /* Skip directories */
+                
+                if (count == index) {
+                    char name_buf[16];
+                    short_name_to_str(ent->name, name_buf, sizeof(name_buf));
+                    size_t need = tiny_strlen(name_buf) + 1;
+                    if (need > out_len) need = out_len;
+                    for (size_t i = 0; i < need - 1; i++) out_name[i] = name_buf[i];
+                    out_name[need - 1] = '\0';
+                    if (out_size) *out_size = ent->file_size;
+                    return 0;
+                }
+                count++;
+            }
+        }
+        if (fat32_read_fat_entry(cluster, &cluster) != 0) return -1;
+    }
+    return -1;
+}

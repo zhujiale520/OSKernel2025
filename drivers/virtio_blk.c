@@ -1,7 +1,7 @@
 #include <stdint.h>
 
-#define VIRTIO_MMIO_BASE        0x10001000UL
-#define MMIO_REG(offset)        (*(volatile uint32_t *)(VIRTIO_MMIO_BASE + (offset)))
+static uint64_t virtio_base = 0x10001000UL;
+#define MMIO_REG(offset)        (*(volatile uint32_t *)(virtio_base + (offset)))
 
 #define VIRTIO_MMIO_MAGIC_VALUE 0x000
 #define VIRTIO_MMIO_VERSION     0x004
@@ -122,22 +122,27 @@ static void setup_vring_layout(void)
 
 int virtio_blk_init(void)
 {
-    if (MMIO_REG(VIRTIO_MMIO_MAGIC_VALUE) != 0x74726976) {
-        print("virtio: bad magic\n");
+    int found = 0;
+    for (uint64_t base = 0x10001000; base < 0x10009000; base += 0x1000) {
+        virtio_base = base;
+        if (MMIO_REG(VIRTIO_MMIO_MAGIC_VALUE) != 0x74726976) continue;
+        if (MMIO_REG(VIRTIO_MMIO_DEVICE_ID) == 0) continue; /* invalid */
+        if (MMIO_REG(VIRTIO_MMIO_DEVICE_ID) == VIRTIO_DEVICE_ID_BLOCK) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        print("virtio-blk not found\n");
         return -1;
     }
+
     virtio_version = MMIO_REG(VIRTIO_MMIO_VERSION);
+    print("virtio-blk found at "); print_hex(virtio_base); print("\n");
     print("virtio version: "); print_hex(virtio_version); print("\n");
-    uint32_t dev_id = MMIO_REG(VIRTIO_MMIO_DEVICE_ID);
-    print("virtio device id: "); print_hex(dev_id); print("\n");
-    uint32_t vendor_id = MMIO_REG(VIRTIO_MMIO_VENDOR_ID);
-    print("virtio vendor: "); print_hex(vendor_id); print("\n");
+    
     if (virtio_version != 1 && virtio_version != 2) {
         print("virtio: unsupported version\n");
-        return -1;
-    }
-    if (MMIO_REG(VIRTIO_MMIO_DEVICE_ID) != VIRTIO_DEVICE_ID_BLOCK) {
-        print("virtio: not a block device\n");
         return -1;
     }
 

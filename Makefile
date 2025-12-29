@@ -6,7 +6,7 @@ CFLAGS = -nostdlib -ffreestanding -O2 -Wall -Wextra -I. -march=rv64imac -mabi=lp
 LDFLAGS = -T kernel/linker.ld -nostdlib -static
 
 KERNEL_SRCS = kernel/entry.S kernel/main.c kernel/print.c \
-	kernel/trap.S kernel/syscall.c \
+	kernel/trap.S kernel/syscall.c kernel/proc.c \
 	drivers/virtio_blk.c fs/fat32.c kernel/elf_loader.c
 KERNEL_OBJS = $(KERNEL_SRCS:.c=.o)
 KERNEL_OBJS := $(KERNEL_OBJS:.S=.o)
@@ -36,6 +36,8 @@ run: kernel-qemu
 	@echo "Starting QEMU..."
 	@echo "If it doesn't exit automatically, press Ctrl+A then X to quit."
 	qemu-system-riscv64 -machine virt -kernel kernel-qemu \
-		-m 128M -nographic -bios default
+		-m 128M -nographic -bios default \
+		-drive file=testsuits-for-oskernel/sdcard.img,format=raw,id=hd0 \
+		-device virtio-blk-device,drive=hd0
 
 .PHONY: all clean run
