@@ -127,16 +127,12 @@ static void *memcpy_simple(void *dst, const void *src, size_t n)
     return dst;
 }
 
-/* Setup stack in the mapped region (0-128MB). We use 64MB (0x4000000) as top */
-#define USER_STACK_TOP_VA 0x04000000UL
-/* Corresponding PA is 0x80400000 + 0x04000000 = 0x84400000 */
-#define USER_STACK_TOP_PA (0x80400000UL + 0x04000000UL)
-
-static uint64_t setup_user_stack(const char *prog_name)
+/* Setup stack in the mapped region (0-128MB). Use per-slot top for isolation. */
+static uint64_t setup_user_stack(uint64_t stack_top, const char *prog_name)
 {
     /* We write to PA, but calculate VA for SP */
-    uintptr_t sp_pa = (uintptr_t)USER_STACK_TOP_PA;
-    uintptr_t sp_va = (uintptr_t)USER_STACK_TOP_VA;
+    uintptr_t sp_va = (uintptr_t)stack_top;
+    uintptr_t sp_pa = (uintptr_t)(stack_top + 0x80400000UL); /* PA offset for user mapping */
     
     /* 放置程序名字符串 */
     size_t len = 0; while (prog_name[len]) len++;
@@ -203,7 +199,9 @@ void run_next_test(void)
         if (!p) { print("no proc slot\n"); break; }
         for (int r = 0; r < 32; r++) p->tf.regs[r] = 0;
         p->tf.sepc = entry;
-        p->tf.regs[2] = setup_user_stack(target_name); /* sp */
+        int slot = proc_slot(p);
+        uint64_t stack_top = user_stack_top_for_slot(slot);
+        p->tf.regs[2] = setup_user_stack(stack_top, target_name); /* sp */
         uint64_t sstatus = 0;
         asm volatile("csrr %0, sstatus" : "=r"(sstatus));
         sstatus &= ~(1ULL << 8); /* SPP=0 (User) */
