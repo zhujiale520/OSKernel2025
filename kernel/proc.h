@@ -1,6 +1,11 @@
 #pragma once
 #include <stdint.h>
 
+/* Simple per-process user stack layout helpers */
+#define USER_STACK_TOP_BASE 0x04000000UL
+#define USER_STACK_SIZE     0x00004000UL /* 16KB */
+#define USER_STACK_STRIDE   0x00010000UL /* 64KB spacing between stacks */
+
 /* Trapframe: general registers x0-31, sepc, sstatus */
 struct trapframe {
     uint64_t regs[32];
@@ -16,7 +21,8 @@ enum proc_state {
     P_UNUSED = 0,
     P_RUNNABLE,
     P_RUNNING,
-    P_ZOMBIE
+    P_ZOMBIE,
+    P_WAITING
 };
 
 struct proc {
@@ -29,6 +35,10 @@ struct proc {
     uint64_t heap_top;
     int fds[MAX_FD]; /* Values are indices into global file_table, -1 if closed */
     char cwd[256];
+    /* Waiting information for wait/waitpid */
+    int waiting;
+    int wait_target;
+    uint64_t wait_status_ptr;
 };
 
 extern struct proc *current;
@@ -42,8 +52,13 @@ struct proc *proc_alloc(int ppid);
 void proc_free(struct proc *p);
 struct proc *proc_find_zombie_child(int ppid);
 struct proc *proc_find_runnable_after(struct proc *p);
+struct proc *proc_find_by_pid(int pid);
 void schedule(void) __attribute__((noreturn));
 void switch_to_user(struct proc *p) __attribute__((noreturn));
+
+/* stack helpers */
+uint64_t user_stack_top_for_slot(int slot);
+uint64_t user_stack_base_for_slot(int slot);
 
 /* helpers */
 int fd_alloc(struct proc *p);
