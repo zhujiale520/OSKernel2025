@@ -5,7 +5,20 @@
 .global user_stack_top
 .global user_stack
 
+.extern __bss_start
+.extern __bss_end
+
 _start:
+    /* 清零 BSS，确保早期标志与全局数据稳定 */
+    la t0, __bss_start
+    la t1, __bss_end
+zero_bss:
+    beq t0, t1, bss_done
+    sd zero, 0(t0)
+    addi t0, t0, 8
+    j zero_bss
+bss_done:
+
     /* 只允许第一个进入的 hart 执行 main，其余 hart 进入待机 */
     la   t0, boot_claimed
     li   t1, 1
