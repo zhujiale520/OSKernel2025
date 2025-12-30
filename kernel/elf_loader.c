@@ -104,11 +104,6 @@ static int load_elf_from_buffer(const uint8_t *img, uint32_t size, uint64_t *ent
     if (entry_out) {
         *entry_out = eh->e_entry; /* Return Virtual Address */
     }
-    print("elf: load ok entry=");
-    if (entry_out) print_hex(*entry_out); else print_hex(0);
-    print(" base=");
-    print_hex(base_vaddr);
-    print("\n");
     return 0;
 }
 

@@ -114,6 +114,8 @@ enum fd_type { FD_NONE = 0, FD_FILE, FD_PIPE, FD_DEVICE };
 struct pipe {
     int used;
     int ref;
+    int rref;
+    int wref;
     uint8_t buf[4096];
     uint32_t r;
     uint32_t w;
@@ -151,6 +153,12 @@ static void duplicate_fds(struct proc *child, struct proc *parent)
         if (child->fds[i] != -1) {
             int fidx = child->fds[i];
             file_table[fidx].ref++;
+            if (file_table[fidx].type == FD_PIPE) {
+                /* Keep pipe endpoint refcounts in sync when forking */
+                struct pipe *p = &pipes[file_table[fidx].pipe_idx];
+                p->ref++;
+                if (file_table[fidx].is_dir) p->wref++; else p->rref++;
+            }
         }
     }
 }
@@ -231,11 +239,22 @@ void file_close(int fidx)
     if (fidx < 0 || fidx >= MAX_FILES) return;
     struct file *f = &file_table[fidx];
     if (!f->used) return;
+
+    if (f->type == FD_PIPE) {
+        struct pipe *p = &pipes[f->pipe_idx];
+        if (f->is_dir) {
+            if (p->wref > 0) p->wref--; /* write end close */
+        } else {
+            if (p->rref > 0) p->rref--; /* read end close */
+        }
+    }
+
     f->ref--;
     if (f->ref <= 0) {
         if (f->type == FD_PIPE) {
-            pipes[f->pipe_idx].ref--;
-            if (pipes[f->pipe_idx].ref <= 0) pipes[f->pipe_idx].used = 0;
+            struct pipe *p = &pipes[f->pipe_idx];
+            p->ref--;
+            if (p->ref <= 0) p->used = 0;
         }
         f->used = 0;
     }
@@ -368,8 +387,8 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             char *dst = (char *)a1;
             uint32_t cnt = 0;
 
-            /* 简单阻塞等待：若为空且仍有写端引用，则等待数据到来 */
-            while (p->r == p->w && p->ref > 0) { /* busy-wait */ }
+            /* Block only while writers may still exist; otherwise return 0 for EOF */
+            while (p->r == p->w && p->wref > 0) { /* busy-wait */ }
 
             for (uint64_t i = 0; i < a2; i++) {
                 if (p->r == p->w) break; /* Empty after consumption */
@@ -879,14 +898,18 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 
             pipes[pidx].used = 1;
             pipes[pidx].ref = 2;
+            pipes[pidx].rref = 1;
+            pipes[pidx].wref = 1;
             pipes[pidx].r = 0;
             pipes[pidx].w = 0;
             
             file_table[idx0].used = 1; file_table[idx0].ref = 1;
             file_table[idx0].type = FD_PIPE; file_table[idx0].pipe_idx = pidx;
+            file_table[idx0].is_dir = 0; /* read end */
             
             file_table[idx1].used = 1; file_table[idx1].ref = 1;
             file_table[idx1].type = FD_PIPE; file_table[idx1].pipe_idx = pidx;
+            file_table[idx1].is_dir = 1; /* write end marker */
             
             current->fds[f0] = idx0;
             current->fds[f1] = idx1;
