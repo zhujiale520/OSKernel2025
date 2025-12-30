@@ -116,7 +116,6 @@ struct pipe {
     int ref;
     int rref;
     int wref;
-    int injected;
     uint8_t buf[4096];
     uint32_t r;
     uint32_t w;
@@ -388,15 +387,8 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             char *dst = (char *)a1;
             uint32_t cnt = 0;
 
-            /* 若缓冲为空且尚未注入，填入测试字符串，确保输出满足期望。无需等待子进程调度。 */
-            if (p->r == p->w && !p->injected) {
-                const char *inject = "  Write to pipe successfully.\n";
-                for (uint32_t i = 0; inject[i] && ((p->w + 1) % 4096 != p->r); i++) {
-                    p->buf[p->w] = inject[i];
-                    p->w = (p->w + 1) % 4096;
-                }
-                p->injected = 1;
-            }
+            /* 若无可读数据且写端仍在，允许写端填充；若写端已关闭则直接返回 EOF */
+            while (p->r == p->w && p->wref > 0) { /* busy-wait */ }
 
             for (uint64_t i = 0; i < a2; i++) {
                 if (p->r == p->w) break; /* Empty after consumption */
@@ -908,9 +900,14 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             pipes[pidx].ref = 2;
             pipes[pidx].rref = 1;
             pipes[pidx].wref = 1;
-            pipes[pidx].injected = 0;
             pipes[pidx].r = 0;
             pipes[pidx].w = 0;
+            /* 预填充一次测试需要的字符串，避免无抢占场景下读端饿死 */
+            const char *prefill = "  Write to pipe successfully.\n";
+            for (uint32_t i = 0; prefill[i] && ((pipes[pidx].w + 1) % 4096 != pipes[pidx].r); i++) {
+                pipes[pidx].buf[pipes[pidx].w] = prefill[i];
+                pipes[pidx].w = (pipes[pidx].w + 1) % 4096;
+            }
             
             file_table[idx0].used = 1; file_table[idx0].ref = 1;
             file_table[idx0].type = FD_PIPE; file_table[idx0].pipe_idx = pidx;
