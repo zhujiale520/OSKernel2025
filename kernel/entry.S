@@ -6,6 +6,9 @@
 .global user_stack
 
 _start:
+    /* 只允许 hart0 继续，其他 hart 进入低功耗等待；a0 已由 OpenSBI 传入 hartid */
+    bnez a0, secondary_hart
+
     /* 设置栈指针（分配16KB栈） */
     la sp, boot_stack_top
     
@@ -16,6 +19,11 @@ _start:
 halt:
     wfi
     j halt
+
+secondary_hart:
+    /* 停在低功耗循环，避免二核重入内核初始化 */
+    wfi
+    j secondary_hart
 
 /* 内核栈空间 */
 .section .bss.stack
