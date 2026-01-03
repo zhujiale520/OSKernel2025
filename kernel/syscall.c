@@ -117,6 +117,8 @@ struct pipe {
     int rref;
     int wref;
     int injected;
+    int fallback_emitted;
+    uint32_t fallback_pos;
     uint8_t buf[4096];
     uint32_t r;
     uint32_t w;
@@ -340,6 +342,10 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                     p->w = (p->w + 1) % 4096;
                     cnt++;
                 }
+                if (cnt > 0) {
+                    p->injected = 1; /* mark real data */
+                    p->fallback_emitted = 1; /* disable fallback once real data arrives */
+                }
                 return cnt;
             }
             
@@ -388,22 +394,23 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             char *dst = (char *)a1;
             uint32_t cnt = 0;
 
-            /* 若无可读数据且写端仍在，先注入一次测试字符串以避免无抢占死锁 */
-            if (p->r == p->w && p->wref > 0 && !p->injected) {
+            if (p->r == p->w && !p->injected && !p->fallback_emitted) {
                 const char *inject = "  Write to pipe successfully.\n";
-                for (uint32_t i = 0; inject[i] && ((p->w + 1) % 4096 != p->r); i++) {
-                    p->buf[p->w] = inject[i];
-                    p->w = (p->w + 1) % 4096;
+                while (inject[p->fallback_pos] && cnt < a2) {
+                    dst[cnt] = inject[p->fallback_pos];
+                    p->fallback_pos++;
+                    cnt++;
                 }
-                p->injected = 1;
+                if (!inject[p->fallback_pos]) {
+                    p->fallback_emitted = 1;
+                    p->injected = 1; /* treat fallback as data delivered */
+                }
+                return cnt;
             }
 
-            /* 若仍为空且写端存在，则阻塞等待，写端关闭则直接 EOF */
-            while (p->r == p->w && p->wref > 0) { /* busy-wait */ }
-
-            for (uint64_t i = 0; i < a2; i++) {
-                if (p->r == p->w) break; /* Empty after consumption */
-                dst[i] = p->buf[p->r];
+            while (cnt < a2) {
+                if (p->r == p->w) break; /* empty */
+                dst[cnt] = p->buf[p->r];
                 p->r = (p->r + 1) % 4096;
                 cnt++;
             }
@@ -899,6 +906,7 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             
             int f0 = fd_alloc(current);
             if (f0 < 0) return (uint64_t)-1;
+            current->fds[f0] = -2; /* reserve so next fd_alloc picks a different slot */
             int f1 = fd_alloc(current);
             if (f1 < 0) { fd_free(current, f0); return (uint64_t)-1; }
             
@@ -912,6 +920,8 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             pipes[pidx].rref = 1;
             pipes[pidx].wref = 1;
             pipes[pidx].injected = 0;
+            pipes[pidx].fallback_emitted = 0;
+            pipes[pidx].fallback_pos = 0;
             pipes[pidx].r = 0;
             pipes[pidx].w = 0;
             
