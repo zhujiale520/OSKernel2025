@@ -128,11 +128,37 @@ static void *memcpy_simple(void *dst, const void *src, size_t n)
 }
 
 /* Setup stack in the mapped region (0-128MB). Use per-slot top for isolation. */
-static uint64_t setup_user_stack(uint64_t stack_top, const char *prog_name)
+struct elf64_ehdr {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} __attribute__((packed));
+
+static uint64_t setup_user_stack(uint64_t stack_top, const char *prog_name, uint64_t entry)
 {
     /* We write to PA, but calculate VA for SP */
     uintptr_t sp_va = (uintptr_t)stack_top;
     uintptr_t sp_pa = (uintptr_t)(stack_top + 0x80400000UL); /* PA offset for user mapping */
+
+    /* Place 16 bytes of random data for AT_RANDOM */
+    sp_pa -= 16;
+    sp_va -= 16;
+    uint64_t rand_ptr_va = (uint64_t)sp_va;
+    {
+        uint8_t *r = (uint8_t *)sp_pa;
+        for (int i = 0; i < 16; i++) r[i] = (uint8_t)(0xA5 ^ (uint8_t)i);
+    }
     
     /* 放置程序名字符串 */
     size_t len = 0; while (prog_name[len]) len++;
@@ -146,14 +172,38 @@ static uint64_t setup_user_stack(uint64_t stack_top, const char *prog_name)
     sp_pa &= ~((uintptr_t)0xF);
     sp_va &= ~((uintptr_t)0xF);
     
-    /* argc/argv 布局：sp[0]=argc, sp[1]=argv0, sp[2]=NULL */
-    sp_pa -= 8 * 3;
-    sp_va -= 8 * 3;
-    
-    uint64_t *p = (uint64_t *)sp_pa;
-    p[0] = 1;
-    p[1] = arg0_ptr_va;
-    p[2] = 0;
+    /* Auxiliary vector for static-PIE (musl) */
+    const struct elf64_ehdr *eh = (const struct elf64_ehdr *)(uintptr_t)0x80400000UL;
+    uint64_t phoff = eh->e_phoff;
+    uint64_t phentsz = eh->e_phentsize;
+    uint64_t phnum = eh->e_phnum;
+
+    const uint64_t AT_NULL   = 0;
+    const uint64_t AT_PHDR   = 3;
+    const uint64_t AT_PHENT  = 4;
+    const uint64_t AT_PHNUM  = 5;
+    const uint64_t AT_PAGESZ = 6;
+    const uint64_t AT_ENTRY  = 9;
+    const uint64_t AT_RANDOM = 25;
+
+    /* Stack layout: argc, argv[], NULL, envp[], NULL, auxv (key,val)..., AT_NULL */
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_NULL;   ((uint64_t *)sp_pa)[1] = 0;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_RANDOM; ((uint64_t *)sp_pa)[1] = rand_ptr_va;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_ENTRY;  ((uint64_t *)sp_pa)[1] = entry;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_PAGESZ; ((uint64_t *)sp_pa)[1] = 4096;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_PHNUM;  ((uint64_t *)sp_pa)[1] = phnum;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_PHENT;  ((uint64_t *)sp_pa)[1] = phentsz;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_PHDR;   ((uint64_t *)sp_pa)[1] = phoff;
+
+    /* envp terminator */
+    sp_pa -= 8; sp_va -= 8; *(uint64_t *)sp_pa = 0;
+
+    /* argv[1]=NULL */
+    sp_pa -= 8; sp_va -= 8; *(uint64_t *)sp_pa = 0;
+    /* argv[0] */
+    sp_pa -= 8; sp_va -= 8; *(uint64_t *)sp_pa = arg0_ptr_va;
+    /* argc */
+    sp_pa -= 8; sp_va -= 8; *(uint64_t *)sp_pa = 1;
     
     return sp_va;
 }
@@ -201,12 +251,14 @@ void run_next_test(void)
         p->tf.sepc = entry;
         int slot = proc_slot(p);
         uint64_t stack_top = user_stack_top_for_slot(slot);
-        p->tf.regs[2] = setup_user_stack(stack_top, target_name); /* sp */
+        p->tf.regs[2] = setup_user_stack(stack_top, target_name, entry); /* sp */
         uint64_t sstatus = 0;
         asm volatile("csrr %0, sstatus" : "=r"(sstatus));
         sstatus &= ~(1ULL << 8); /* SPP=0 (User) */
         sstatus |= (1ULL << 5);  /* SPIE=1 (Enable interrupts after sret) */
         sstatus |= (1ULL << 18); /* SUM=1 (Allow Supervisor User Memory access) */
+        /* Enable FP for userland (FS=01 Initial) to run rv64gc/lp64d binaries */
+        sstatus |= (1ULL << 13);
         p->tf.sstatus = sstatus;
         /* stdout fd 1 preset */
         p->fds[0] = 0; p->fds[1] = 1; p->fds[2] = 2;
@@ -219,7 +271,7 @@ void run_next_test(void)
         asm volatile("csrw satp, %0" :: "r"(satp_val));
         asm volatile("sfence.vma");
         
-        schedule();
+        return;
     }
 }
 
@@ -227,6 +279,9 @@ void main()
 {
     /* 设置 stvec 到 trap_entry */
     asm volatile("csrw stvec, %0" :: "r"((uint64_t)trap_entry));
+
+    /* 允许用户态读取 cycle/time/instret（否则 libc 的时间函数可能触发 illegal instruction） */
+    asm volatile("csrw scounteren, %0" :: "r"(7ULL));
 
     // 1. 输出启动信息
     print("\n================================\n");
@@ -251,7 +306,7 @@ void main()
     extern void syscall_init(void);
     syscall_init();
     proc_init();
-    run_next_test();
+    schedule();
 }
 
 /* 当 syscall_action 请求回到内核调度时由 trap.S 调用 */

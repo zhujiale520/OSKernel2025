@@ -22,7 +22,8 @@ enum proc_state {
     P_RUNNABLE,
     P_RUNNING,
     P_ZOMBIE,
-    P_WAITING
+    P_WAITING,
+    P_SLEEPING
 };
 
 struct proc {
@@ -34,11 +35,27 @@ struct proc {
     uint64_t kstack;
     uint64_t heap_top;
     int fds[MAX_FD]; /* Values are indices into global file_table, -1 if closed */
+    uint8_t fd_flags[MAX_FD]; /* Per-fd flags (e.g. FD_CLOEXEC) */
     char cwd[256];
     /* Waiting information for wait/waitpid */
     int waiting;
     int wait_target;
     uint64_t wait_status_ptr;
+
+    /* Process group and termination metadata */
+    int pgid;
+    int exited_by_signal;
+    int term_signal;
+
+    /* waitid metadata (used when blocking in kernel) */
+    int wait_is_waitid;
+    uint64_t wait_infop_ptr;
+    int wait_idtype;
+    int wait_id;
+    int wait_options;
+
+    /* Sleep support (nanosleep/sleep) */
+    uint64_t sleep_until;
 };
 
 extern struct proc *current;

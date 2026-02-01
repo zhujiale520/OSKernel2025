@@ -10,6 +10,14 @@ typedef unsigned long size_t;
 typedef long ssize_t;
 typedef long pid_t;
 
+/* errno values (Linux) */
+#define EPERM  1
+#define ESRCH  3
+#define EBADF  9
+#define ECHILD 10
+#define EINVAL 22
+#define ENOSYS 38
+
 struct linux_dirent64 {
     uint64_t d_ino;
     uint64_t d_off;
@@ -43,6 +51,23 @@ struct tms {
     long tms_cutime;
     long tms_cstime;
 };
+
+struct elf64_ehdr {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} __attribute__((packed));
 
 struct kstat {
     uint64_t st_dev;
@@ -153,6 +178,7 @@ static void duplicate_fds(struct proc *child, struct proc *parent)
 {
     for (int i = 0; i < MAX_FD; i++) {
         child->fds[i] = parent->fds[i];
+        child->fd_flags[i] = parent->fd_flags[i];
         if (child->fds[i] != -1) {
             int fidx = child->fds[i];
             file_table[fidx].ref++;
@@ -171,11 +197,71 @@ static void wake_waiting_parent(struct proc *child)
     struct proc *parent = proc_find_by_pid(child->ppid);
     if (!parent || !parent->waiting) return;
 
+    if (parent->wait_is_waitid) {
+        int idtype = parent->wait_idtype;
+        int id = parent->wait_id;
+
+        int match = 0;
+        if (idtype == 0) { /* P_ALL */
+            match = 1;
+        } else if (idtype == 1) { /* P_PID */
+            match = (child->pid == id);
+        } else if (idtype == 2) { /* P_PGID */
+            match = (child->pgid == id);
+        }
+        if (!match) return;
+
+        if (parent->wait_infop_ptr) {
+            /* Minimal musl-compatible siginfo_t layout for CLD_* */
+            struct siginfo_cld {
+                int si_signo;
+                int si_errno;
+                int si_code;
+                int __pad0;
+                int si_pid;
+                int si_uid;
+                int si_status;
+            } *infop = (struct siginfo_cld *)(uintptr_t)parent->wait_infop_ptr;
+
+            const int SIGCHLD = 17;
+            const int CLD_EXITED = 1;
+            const int CLD_KILLED = 2;
+
+            infop->si_signo = SIGCHLD;
+            infop->si_errno = 0;
+            if (child->exited_by_signal) {
+                infop->si_code = CLD_KILLED;
+                infop->si_status = child->term_signal;
+            } else {
+                infop->si_code = CLD_EXITED;
+                infop->si_status = child->exit_code & 0xff;
+            }
+            infop->si_pid = child->pid;
+            infop->si_uid = 0;
+        }
+
+        parent->waiting = 0;
+        parent->wait_is_waitid = 0;
+        parent->wait_infop_ptr = 0;
+        parent->wait_idtype = 0;
+        parent->wait_id = 0;
+        parent->wait_options = 0;
+        parent->state = P_RUNNABLE;
+        parent->tf.regs[10] = 0; /* waitid returns 0 */
+        proc_free(child);
+        return;
+    }
+
+    /* wait4/waitpid-style */
     if (parent->wait_target != -1 && parent->wait_target != child->pid) return;
 
     if (parent->wait_status_ptr) {
         int *st = (int *)(uintptr_t)parent->wait_status_ptr;
-        *st = (child->exit_code & 0xff) << 8;
+        if (child->exited_by_signal) {
+            *st = (child->term_signal & 0x7f);
+        } else {
+            *st = (child->exit_code & 0xff) << 8;
+        }
     }
     parent->waiting = 0;
     parent->wait_target = 0;
@@ -185,10 +271,19 @@ static void wake_waiting_parent(struct proc *child)
     proc_free(child);
 }
 
-static uint64_t build_exec_stack(uint64_t stack_top, const char *prog_name)
+static uint64_t build_exec_stack(uint64_t stack_top, const char *prog_name, uint64_t entry)
 {
     uintptr_t sp_va = (uintptr_t)stack_top;
     uintptr_t sp_pa = (uintptr_t)user_pa_from_va(stack_top);
+
+    /* AT_RANDOM: 16 bytes */
+    sp_pa -= 16;
+    sp_va -= 16;
+    uint64_t rand_ptr_va = (uint64_t)sp_va;
+    {
+        uint8_t *r = (uint8_t *)sp_pa;
+        for (int i = 0; i < 16; i++) r[i] = (uint8_t)(0xA5 ^ (uint8_t)i);
+    }
 
     size_t len = 0; while (prog_name[len]) len++;
     sp_pa -= (len + 1);
@@ -200,13 +295,31 @@ static uint64_t build_exec_stack(uint64_t stack_top, const char *prog_name)
     sp_pa &= ~((uintptr_t)0xF);
     sp_va &= ~((uintptr_t)0xF);
 
-    sp_pa -= 8 * 3;
-    sp_va -= 8 * 3;
+    const struct elf64_ehdr *eh = (const struct elf64_ehdr *)(uintptr_t)0x80400000UL;
+    uint64_t phoff = eh->e_phoff;
+    uint64_t phentsz = eh->e_phentsize;
+    uint64_t phnum = eh->e_phnum;
 
-    uint64_t *p = (uint64_t *)sp_pa;
-    p[0] = 1;
-    p[1] = arg0_ptr_va;
-    p[2] = 0;
+    const uint64_t AT_NULL   = 0;
+    const uint64_t AT_PHDR   = 3;
+    const uint64_t AT_PHENT  = 4;
+    const uint64_t AT_PHNUM  = 5;
+    const uint64_t AT_PAGESZ = 6;
+    const uint64_t AT_ENTRY  = 9;
+    const uint64_t AT_RANDOM = 25;
+
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_NULL;   ((uint64_t *)sp_pa)[1] = 0;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_RANDOM; ((uint64_t *)sp_pa)[1] = rand_ptr_va;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_ENTRY;  ((uint64_t *)sp_pa)[1] = entry;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_PAGESZ; ((uint64_t *)sp_pa)[1] = 4096;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_PHNUM;  ((uint64_t *)sp_pa)[1] = phnum;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_PHENT;  ((uint64_t *)sp_pa)[1] = phentsz;
+    sp_pa -= 8 * 2; sp_va -= 8 * 2; ((uint64_t *)sp_pa)[0] = AT_PHDR;   ((uint64_t *)sp_pa)[1] = phoff;
+
+    sp_pa -= 8; sp_va -= 8; *(uint64_t *)sp_pa = 0; /* envp[0]=NULL */
+    sp_pa -= 8; sp_va -= 8; *(uint64_t *)sp_pa = 0; /* argv[1]=NULL */
+    sp_pa -= 8; sp_va -= 8; *(uint64_t *)sp_pa = arg0_ptr_va;
+    sp_pa -= 8; sp_va -= 8; *(uint64_t *)sp_pa = 1;
 
     return sp_va;
 }
@@ -300,16 +413,20 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     if (slot < 0) return (uint64_t)-1;
 
     /* Debug print for syscalls */
-    /*
-    print("syscall: "); print_hex(a7);
-    print(" a0="); print_hex(a0);
-    print(" a1="); print_hex(a1);
-    print(" a2="); print_hex(a2);
-    print("\n");
-    */
+    /* Short syscall trace for onsitefinal debugging */
+    {
+        static int dbg_count = 0;
+        if (dbg_count < 120) {
+            print("syscall: ");
+            print_hex(a7);
+            print("\n");
+            dbg_count++;
+        }
+    }
 
     switch (a7) {
     case 93: /* exit */
+    case 94: /* exit_group */
         syscall_exit_code = a0;
         current->exit_code = (int)a0;
         if (current->ppid == 0) {
@@ -531,6 +648,75 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         if (fd >= 0 && fd < MAX_FD && current->fds[fd] != -1) {
             file_close(current->fds[fd]);
             current->fds[fd] = -1;
+            current->fd_flags[fd] = 0;
+        }
+        return 0;
+    }
+    case 25: /* fcntl */
+    {
+        /* Minimal support for tests: F_GETFD/F_SETFD for FD_CLOEXEC. */
+        int fd = (int)a0;
+        int cmd = (int)a1;
+        uint64_t arg = a2;
+
+        /* Linux fcntl commands */
+        const int F_GETFD = 1;
+        const int F_SETFD = 2;
+        const int F_GETFL = 3;
+        const int F_SETFL = 4;
+        const int FD_CLOEXEC = 1;
+
+        if (fd < 0 || fd >= MAX_FD || current->fds[fd] == -1) return (uint64_t)-EBADF;
+
+        if (cmd == F_GETFD) {
+            return (uint64_t)(current->fd_flags[fd] & FD_CLOEXEC);
+        }
+        if (cmd == F_SETFD) {
+            if (arg & ~(uint64_t)FD_CLOEXEC) return (uint64_t)-EINVAL;
+            current->fd_flags[fd] = (uint8_t)(arg & FD_CLOEXEC);
+            return 0;
+        }
+
+        /* Common libc usage: query/set file status flags (we model none). */
+        if (cmd == F_GETFL) {
+            return 0;
+        }
+        if (cmd == F_SETFL) {
+            (void)arg;
+            return 0;
+        }
+
+        return (uint64_t)-EINVAL;
+    }
+    case 436: /* close_range */
+    {
+        unsigned int first = (unsigned int)a0;
+        unsigned int last = (unsigned int)a1;
+        unsigned int flags = (unsigned int)a2;
+
+        const unsigned int CLOSE_RANGE_CLOEXEC = 4U;
+        const unsigned int allowed_flags = CLOSE_RANGE_CLOEXEC;
+        const unsigned int FD_CLOEXEC = 1U;
+
+        if (flags & ~allowed_flags) return (uint64_t)-EINVAL;
+        if (last < first) return (uint64_t)-EINVAL;
+
+        unsigned int end = last;
+        if (end == ~0U || end >= (unsigned int)MAX_FD) end = (unsigned int)MAX_FD - 1U;
+
+        if (flags & CLOSE_RANGE_CLOEXEC) {
+            for (unsigned int fd = first; fd <= end; fd++) {
+                if (current->fds[fd] != -1) current->fd_flags[fd] |= (uint8_t)FD_CLOEXEC;
+            }
+            return 0;
+        }
+
+        for (unsigned int fd = first; fd <= end; fd++) {
+            if (current->fds[fd] != -1) {
+                file_close(current->fds[fd]);
+                current->fds[fd] = -1;
+                current->fd_flags[fd] = 0;
+            }
         }
         return 0;
     }
@@ -582,6 +768,9 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         struct proc *child = proc_alloc(current->pid);
         if (!child) return (uint64_t)-1;
 
+        /* Inherit process group */
+        child->pgid = current->pgid;
+
         int pslot = proc_slot(current);
         int cslot = proc_slot(child);
 
@@ -609,6 +798,9 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         syscall_action = 1; /* reschedule to give child a chance to run */
         return child->pid;
     }
+    case 435: /* clone3 */
+        /* Returning success here breaks libc; report ENOSYS so it can fall back to clone(). */
+        return (uint64_t)-ENOSYS;
     case 260: /* wait4 */
     {
         int pid = (int)a0;
@@ -648,45 +840,85 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         /* a0: idtype, a1: id, a2: infop, a3: options */
         int idtype = (int)a0;
         int id = (int)a1;
-        struct siginfo {
+        uint64_t infop_ptr = a2;
+        int options = (int)a3;
+
+        /* Minimal musl-compatible siginfo_t layout for CLD_* */
+        struct siginfo_cld {
             int si_signo;
             int si_errno;
             int si_code;
             int __pad0;
             int si_pid;
             int si_uid;
-        } *infop = (struct siginfo *)a2;
+            int si_status;
+        } *infop = (struct siginfo_cld *)(uintptr_t)infop_ptr;
 
-        /*
-        print("waitid: type="); print_int(idtype);
-        print(" id="); print_int(id);
-        print("\n");
-        */
+        const int WNOHANG = 1;
+        const int SIGCHLD = 17;
+        const int CLD_EXITED = 1;
+        const int CLD_KILLED = 2;
 
-        int pid = -1;
-        if (idtype == 0) { /* P_ALL */
-            if (last_child > 0) pid = last_child;
-        } else if (idtype == 1) { /* P_PID */
-            if (last_child > 0 && (id == last_child || id > 0)) pid = id;
-            else if (id > 0) pid = id; /* Hack */
+        int has_child = 0;
+        struct proc *z = 0;
+        for (int i = 0; i < MAX_PROC; i++) {
+            if (procs[i].ppid != current->pid) continue;
+            has_child = 1;
+            if (procs[i].state != P_ZOMBIE) continue;
+
+            int match = 0;
+            if (idtype == 0) { /* P_ALL */
+                match = 1;
+            } else if (idtype == 1) { /* P_PID */
+                match = (procs[i].pid == id);
+            } else if (idtype == 2) { /* P_PGID */
+                match = (procs[i].pgid == id);
+            }
+            if (match) { z = &procs[i]; break; }
         }
 
-        if (pid > 0) {
+        if (z) {
             if (infop) {
-                infop->si_signo = 17; /* SIGCHLD */
+                infop->si_signo = SIGCHLD;
                 infop->si_errno = 0;
-                infop->si_code = 1; /* CLD_EXITED */
-                infop->si_pid = pid;
+                if (z->exited_by_signal) {
+                    infop->si_code = CLD_KILLED;
+                    infop->si_status = z->term_signal;
+                } else {
+                    infop->si_code = CLD_EXITED;
+                    infop->si_status = z->exit_code & 0xff;
+                }
+                infop->si_pid = z->pid;
                 infop->si_uid = 0;
             }
-            if (pid == last_child) last_child = -1;
+            proc_free(z);
             return 0;
         }
-        
-        /* If WNOHANG (1) is set in options (a3), return 0 even if no child */
-        if (a3 & 1) return 0;
 
-        return (uint64_t)-1;
+        if (!has_child) return (uint64_t)-ECHILD;
+
+        if (options & WNOHANG) {
+            if (infop) {
+                infop->si_signo = 0;
+                infop->si_errno = 0;
+                infop->si_code = 0;
+                infop->si_pid = 0;
+                infop->si_uid = 0;
+                infop->si_status = 0;
+            }
+            return 0;
+        }
+
+        /* Block until a matching child exits */
+        current->waiting = 1;
+        current->wait_is_waitid = 1;
+        current->wait_infop_ptr = infop_ptr;
+        current->wait_idtype = idtype;
+        current->wait_id = id;
+        current->wait_options = options;
+        current->state = P_WAITING;
+        syscall_action = 1;
+        return 0;
     }
     case 134: /* rt_sigaction */
         return 0;
@@ -719,11 +951,23 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             if (load_elf_from_fat32(alt, &entry) != 0) return (uint64_t)-1;
         }
 
+        /* Honor close-on-exec file descriptor flags. */
+        {
+            const uint8_t FD_CLOEXEC = 1;
+            for (int fd = 0; fd < MAX_FD; fd++) {
+                if (current->fds[fd] != -1 && (current->fd_flags[fd] & FD_CLOEXEC)) {
+                    file_close(current->fds[fd]);
+                    current->fds[fd] = -1;
+                    current->fd_flags[fd] = 0;
+                }
+            }
+        }
+
         for (int r = 0; r < 32; r++) current->tf.regs[r] = 0;
         current->tf.sepc = entry;
         int slot = proc_slot(current);
         uint64_t stack_top = user_stack_top_for_slot(slot);
-        current->tf.regs[2] = build_exec_stack(stack_top, path);
+        current->tf.regs[2] = build_exec_stack(stack_top, path, entry);
         current->heap_top = 0x00200000;
 
         uint64_t sstatus = 0;
@@ -731,6 +975,8 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         sstatus &= ~(1ULL << 8);
         sstatus |= (1ULL << 5);
         sstatus |= (1ULL << 18);
+        /* Enable FP for userland (FS=01 Initial) */
+        sstatus |= (1ULL << 13);
         current->tf.sstatus = sstatus;
 
         return 0; /* No return to old image; sepc/sp now point to new program */
@@ -740,10 +986,50 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         struct timespec *req = (struct timespec *)a0;
         struct timespec *rem = (struct timespec *)a1;
         if (req) {
-            volatile int i = 0;
-            for (i = 0; i < 500000; i++);
+            /* Cooperative sleep based on rdtime ticks (assume 10MHz like gettimeofday). */
+            uint64_t now = get_cycle();
+            uint64_t ticks = 0;
+            if (req->tv_sec > 0) ticks += (uint64_t)req->tv_sec * 10000000ULL;
+            if (req->tv_nsec > 0) ticks += (uint64_t)req->tv_nsec / 100ULL;
+            if (ticks > 0) {
+                current->sleep_until = now + ticks;
+                current->state = P_SLEEPING;
+                syscall_action = 1;
+            }
         }
         if (rem) { rem->tv_sec = 0; rem->tv_nsec = 0; }
+        return 0;
+    }
+    case 154: /* setpgid */
+    {
+        pid_t pid = (pid_t)a0;
+        pid_t pgid = (pid_t)a1;
+        if (pid == 0) pid = current->pid;
+        if (pgid == 0) pgid = pid;
+
+        struct proc *p = proc_find_by_pid(pid);
+        if (!p) return (uint64_t)-ESRCH;
+        /* Minimal permission model: only allow self or direct child */
+        if (pid != current->pid && p->ppid != current->pid) return (uint64_t)-EPERM;
+
+        p->pgid = (int)pgid;
+        return 0;
+    }
+    case 129: /* kill */
+    {
+        pid_t pid = (pid_t)a0;
+        int sig = (int)a1;
+        struct proc *p = proc_find_by_pid(pid);
+        if (!p) return (uint64_t)-ESRCH;
+        if (sig == 0) return 0;
+
+        p->exited_by_signal = 1;
+        p->term_signal = sig;
+        p->exit_code = 0;
+
+        /* Mark as zombie and wake waiting parent if needed */
+        wake_waiting_parent(p);
+        if (p->state != P_UNUSED) p->state = P_ZOMBIE;
         return 0;
     }
     case 169: { /* gettimeofday */
@@ -874,6 +1160,9 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         int fidx = current->fds[oldfd];
         file_table[fidx].ref++;
         current->fds[newfd] = fidx;
+
+        /* dup() clears FD_CLOEXEC on the new descriptor */
+        current->fd_flags[newfd] = 0;
         
         return newfd;
     }
@@ -889,11 +1178,15 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         if (current->fds[newfd] != -1) {
             file_close(current->fds[newfd]);
             current->fds[newfd] = -1;
+            current->fd_flags[newfd] = 0;
         }
         
         int fidx = current->fds[oldfd];
         file_table[fidx].ref++;
         current->fds[newfd] = fidx;
+
+        /* dup3() clears FD_CLOEXEC unless O_CLOEXEC is requested (not modeled here). */
+        current->fd_flags[newfd] = 0;
         
         return newfd;
     }
