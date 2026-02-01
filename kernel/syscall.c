@@ -15,6 +15,7 @@ typedef long pid_t;
 #define ESRCH  3
 #define EBADF  9
 #define ECHILD 10
+#define EAGAIN 11
 #define EINVAL 22
 #define ENOSYS 38
 
@@ -134,7 +135,7 @@ volatile uint64_t syscall_exit_code = 0;
 #define FILE_BUF_SZ 4096
 #define MAX_FILES 128
 
-enum fd_type { FD_NONE = 0, FD_FILE, FD_PIPE, FD_DEVICE };
+enum fd_type { FD_NONE = 0, FD_FILE, FD_PIPE, FD_DEVICE, FD_EVENTFD };
 
 struct pipe {
     int used;
@@ -155,11 +156,20 @@ struct file {
     int ref;
     enum fd_type type;
     int pipe_idx;
+    int eventfd_idx;
     int is_dir;
     uint8_t buf[FILE_BUF_SZ];
     uint32_t size;
     uint32_t off;
 } file_table[MAX_FILES];
+
+struct eventfd_obj {
+    int used;
+    int ref;
+    uint64_t counter;
+    int flags;
+};
+static struct eventfd_obj eventfds[16];
 
 static inline uint64_t user_pa_from_va(uint64_t va)
 {
@@ -328,6 +338,7 @@ void syscall_init(void)
 {
     memset_simple(file_table, 0, sizeof(file_table));
     memset_simple(pipes, 0, sizeof(pipes));
+    memset_simple(eventfds, 0, sizeof(eventfds));
     
     /* Pre-allocate stdin, stdout, stderr */
     /* 0: stdin */
@@ -362,6 +373,14 @@ void file_close(int fidx)
             if (p->wref > 0) p->wref--; /* write end close */
         } else {
             if (p->rref > 0) p->rref--; /* read end close */
+        }
+    } else if (f->type == FD_EVENTFD) {
+        if (f->eventfd_idx >= 0 && f->eventfd_idx < (int)(sizeof(eventfds)/sizeof(eventfds[0]))) {
+            struct eventfd_obj *e = &eventfds[f->eventfd_idx];
+            if (e->used) {
+                e->ref--;
+                if (e->ref <= 0) e->used = 0;
+            }
         }
     }
 
@@ -441,6 +460,24 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         if (a0 < MAX_FD && current->fds[a0] != -1) {
             int fidx = current->fds[a0];
             struct file *f = &file_table[fidx];
+
+            if (f->type == FD_EVENTFD) {
+                if (a2 < 8) return (uint64_t)-EINVAL;
+                if (f->eventfd_idx < 0 || f->eventfd_idx >= (int)(sizeof(eventfds)/sizeof(eventfds[0]))) return (uint64_t)-EINVAL;
+                struct eventfd_obj *e = &eventfds[f->eventfd_idx];
+                if (!e->used) return (uint64_t)-EINVAL;
+
+                uint64_t val = *(uint64_t *)(uintptr_t)a1;
+                if (val == 0) return (uint64_t)-EINVAL;
+
+                const uint64_t max_val = 0xfffffffffffffffeULL;
+                if (e->counter > max_val - val) {
+                    if (e->flags & 0x800) return (uint64_t)-EAGAIN; /* EFD_NONBLOCK */
+                    return (uint64_t)-EAGAIN;
+                }
+                e->counter += val;
+                return 8;
+            }
             
             if (f->type == FD_DEVICE) { /* stdout/stderr */
                 if (fidx == 1 || fidx == 2) {
@@ -505,6 +542,30 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         if (fd < 0 || fd >= MAX_FD || current->fds[fd] == -1) return (uint64_t)-1;
         int fidx = current->fds[fd];
         struct file *f = &file_table[fidx];
+
+        if (f->type == FD_EVENTFD) {
+            if (a2 < 8) return (uint64_t)-EINVAL;
+            if (f->eventfd_idx < 0 || f->eventfd_idx >= (int)(sizeof(eventfds)/sizeof(eventfds[0]))) return (uint64_t)-EINVAL;
+            struct eventfd_obj *e = &eventfds[f->eventfd_idx];
+            if (!e->used) return (uint64_t)-EINVAL;
+
+            if (e->counter == 0) {
+                if (e->flags & 0x800) return (uint64_t)-EAGAIN; /* EFD_NONBLOCK */
+                return (uint64_t)-EAGAIN;
+            }
+
+            uint64_t out = 0;
+            if (e->flags & 0x1) { /* EFD_SEMAPHORE */
+                out = 1;
+                e->counter -= 1;
+            } else {
+                out = e->counter;
+                e->counter = 0;
+            }
+
+            *(uint64_t *)(uintptr_t)a1 = out;
+            return 8;
+        }
         
         if (f->type == FD_PIPE) {
             struct pipe *p = &pipes[f->pipe_idx];
@@ -760,6 +821,50 @@ uint64_t syscall_handle(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     }
     case 215: /* munmap */
         return 0;
+    case 19: /* eventfd2 */
+    {
+        unsigned int initval = (unsigned int)a0;
+        int flags = (int)a1;
+
+        const int EFD_SEMAPHORE = 0x1;
+        const int EFD_NONBLOCK  = 0x800;
+        const int EFD_CLOEXEC   = 0x80000;
+        const int allowed = EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC;
+        if (flags & ~allowed) return (uint64_t)-EINVAL;
+
+        int fd = fd_alloc(current);
+        if (fd < 0) return (uint64_t)-1;
+        int fidx = file_alloc();
+        if (fidx < 0) { fd_free(current, fd); return (uint64_t)-1; }
+
+        int eidx = -1;
+        for (int i = 0; i < (int)(sizeof(eventfds)/sizeof(eventfds[0])); i++) {
+            if (!eventfds[i].used) { eidx = i; break; }
+        }
+        if (eidx < 0) {
+            file_close(fidx);
+            fd_free(current, fd);
+            return (uint64_t)-1;
+        }
+
+        eventfds[eidx].used = 1;
+        eventfds[eidx].ref = 1;
+        eventfds[eidx].counter = (uint64_t)initval;
+        eventfds[eidx].flags = flags;
+
+        current->fds[fd] = fidx;
+        current->fd_flags[fd] = (flags & EFD_CLOEXEC) ? 1 : 0;
+
+        struct file *f = &file_table[fidx];
+        f->type = FD_EVENTFD;
+        f->eventfd_idx = eidx;
+        f->pipe_idx = -1;
+        f->is_dir = 0;
+        f->size = 0;
+        f->off = 0;
+
+        return fd;
+    }
     case 96: /* set_tid_address */
         return current ? current->pid : 0;
     case 220: /* clone / fork */
